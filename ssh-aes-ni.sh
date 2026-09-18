@@ -1,13 +1,20 @@
-#!/usr/bin/env sh
-# ssh-aesni.sh — accelerated SSH AES ciphers in Mbps, with per-cipher CPU clock.
-#   * kernel modes: from `sysctl -a` (BSD/macOS) or /proc/crypto (Linux)
-#   * candidates:   `ssh -Q cipher` FILTERED THROUGH the kernel probe
-#   * confirmation: OpenSSL WITH/WITHOUT benchmark, each stamped with live MHz
-#      Script by Gemni - Google AI
-THRESHOLD=130
-SW_TIER=500000
+#!/bin/sh
+# ssh-aesni.sh — benchmark the SSH AES ciphers that are AES-NI accelerated.
+#   * kernel modes : enumerated from `sysctl -a` (BSD/macOS) or /proc/crypto (Linux)
+#   * candidates   : `ssh -Q cipher` FILTERED THROUGH the kernel probe (no static list)
+#   * benchmark    : OpenSSL WITH vs WITHOUT AES-NI, throughput in Mbps, fastest->slowest
+#   * accuracy     : pinned to one core; the CPU clock read is that same core's clock
+#
+# Usage:  [PIN=N] [sudo] sh ssh-aesni.sh
+#   PIN=N  pin the benchmark to core N (default: last core). sudo needed on Apple
+#          Silicon for live frequency via powermetrics.
+
+THRESHOLD=130      # WITH must be >= 1.30x WITHOUT to call the toggle "working"
+SW_TIER=500000     # internal units (1000s of bytes/sec) = 500 MB/s
 command -v ssh >/dev/null 2>&1 || { echo "ssh not found" >&2; exit 1; }
 
+# --- small helpers ---------------------------------------------------------
+# Kernel names counter mode ICM; ssh/openssl call it CTR. Naming bridge only.
 norm_mode() { echo "$1" | tr 'a-z' 'A-Z' | sed 's/^ICM$/CTR/'; }
 ssh_mode()  { echo "${1%@*}" | sed -E 's/^aes[0-9]+-?([a-z0-9]+)$/\1/; s/^rijndael-(cbc)$/\1/'; }
 evp_name()  {
@@ -15,25 +22,42 @@ evp_name()  {
     echo "$c" | sed -E 's/^aes([0-9]+)-?([a-z0-9]+)$/aes-\1-\2/'
 }
 
-# Live current CPU frequency in MHz (best effort per platform).
-cpu_mhz() {
+max_core_mhz() {   # highest current freq across all cores (no-pin / fallback)
+    case "$(uname -s)" in
+        FreeBSD|*BSD)
+            i=0; while [ "$i" -lt "$ncpu" ]; do sysctl -n dev.cpu.$i.freq 2>/dev/null; i=$((i+1)); done \
+                | sort -rn | head -n1 ;;
+        Linux)
+            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null \
+                | sort -rn | head -n1 | awk '{printf "%.0f",$1/1000}' ;;
+    esac
+}
+
+cpu_mhz() {        # current clock of the PINNED core (fallback: max core/cluster)
     m=""
     case "$(uname -s)" in
-        FreeBSD|*BSD) m=$(sysctl -n dev.cpu.0.freq 2>/dev/null) ;;
+        FreeBSD|*BSD)
+            [ -n "$PINCMD" ] && m=$(sysctl -n dev.cpu.$PIN.freq 2>/dev/null)
+            [ -z "$m" ] && m=$(max_core_mhz) ;;
         Linux)
-            if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
-                m=$(awk '{printf "%.0f",$1/1000}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq 2>/dev/null)
-            else
-                m=$(awk -F: 'tolower($1) ~ /mhz/ {gsub(/ /,"",$2); printf "%.0f",$2; exit}' /proc/cpuinfo 2>/dev/null)
-            fi ;;
+            if [ -n "$PINCMD" ] && [ -r /sys/devices/system/cpu/cpu$PIN/cpufreq/scaling_cur_freq ]; then
+                m=$(awk '{printf "%.0f",$1/1000}' /sys/devices/system/cpu/cpu$PIN/cpufreq/scaling_cur_freq)
+            fi
+            [ -z "$m" ] && m=$(max_core_mhz) ;;
         Darwin)
-            f=$(sysctl -n hw.cpufrequency 2>/dev/null)
-            [ -n "$f" ] && m=$(awk -v f="$f" 'BEGIN{printf "%.0f",f/1000000}') ;;
+            if [ "$(uname -m)" = arm64 ]; then
+                # Apple Silicon: live freq via powermetrics (root). Highest active cluster.
+                [ "$(id -u)" -eq 0 ] && m=$(powermetrics --samplers cpu_power -i1000 -n1 2>/dev/null \
+                    | awk '/[Ff]requency:/ && /MHz/ {for(i=1;i<=NF;i++) if($i=="MHz"){v=$(i-1)+0; if(v>mx)mx=v}} END{if(mx)printf "%.0f",mx}')
+            else
+                f=$(sysctl -n hw.cpufrequency 2>/dev/null)   # Intel: Hz
+                [ -n "$f" ] && m=$(awk -v f="$f" 'BEGIN{printf "%.0f",f/1000000}')
+            fi ;;
     esac
     [ -n "$m" ] && echo "$m" || echo "n/a"
 }
 
-# --- 1. Enumerate accelerated AES modes from the kernel ---------------------
+# --- 1. Enumerate accelerated AES modes from the kernel (no static OID) -----
 kernel_modes() {
     { if [ -r /proc/crypto ]; then
         awk '/^name[ \t]*:/{n=$3}/^driver[ \t]*:/{if($3~/aesni/)print n}' /proc/crypto \
@@ -60,18 +84,33 @@ done
 accel_modes=$(for c in $accel_ciphers; do norm_mode "$(ssh_mode "$c")"; done | sort -u)
 candidates=$(for c in $accel_ciphers; do evp_name "$c"; done | sort -u)
 
-echo "SSH AES modes (ssh -Q cipher):     $(echo $ssh_modes | tr '\n' ' ')"
+echo "SSH AES modes (ssh -Q cipher):        $(echo $ssh_modes | tr '\n' ' ')"
 if [ "$have_kernel" = yes ]; then
-    echo "Kernel accelerated modes (sysctl): $(echo $kmodes | tr '\n' ' ')"
+    echo "Kernel accelerated modes (sysctl):    $(echo $kmodes | tr '\n' ' ')"
     echo "Accelerated (ssh filtered by kernel): $(echo $accel_modes | tr '\n' ' ')"
 else
     if sysctl -a 2>/dev/null | grep -qiE 'features.*AES|FEAT_AES'; then f=present; else f="not detected"; fi
     echo "No per-mode kernel crypto enumeration on $(uname -s) (CPU AES: $f); using all SSH AES ciphers."
 fi
 [ -z "$candidates" ] && { echo; echo "No SSH AES ciphers pass the kernel filter."; exit 0; }
+
+# --- pin the benchmark to one core so the clock we read == the core that ran -
+PIN=${PIN:-}
+ncpu=$( sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 1 )
+[ -z "$PIN" ] && PIN=$((ncpu-1))     # default last core (cpu0 tends to service IRQs)
+PINCMD=""
+case "$(uname -s)" in
+    FreeBSD|*BSD) command -v cpuset  >/dev/null 2>&1 && PINCMD="cpuset -l $PIN" ;;
+    Linux)        command -v taskset >/dev/null 2>&1 && PINCMD="taskset -c $PIN" ;;
+esac
+[ -n "$PINCMD" ] \
+    && echo "Pinned to CPU $PIN ($PINCMD) — reading that core's clock." \
+    || echo "No CPU pinning here — reading the max core/cluster clock."
+[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] && [ "$(id -u)" -ne 0 ] && \
+    echo "  (Apple Silicon: run with sudo for live frequency via powermetrics.)"
 echo "Idle CPU clock: $(cpu_mhz) MHz"; echo
 
-# --- 3. Pick a toggle-capable openssl --------------------------------------
+# --- 3. Pick a toggle-capable openssl (real OpenSSL, not LibreSSL) ----------
 is_libre() { "$1" version 2>/dev/null | grep -qi libressl; }
 pick_openssl() {
     p0=$(command -v openssl 2>/dev/null)
@@ -86,19 +125,20 @@ OSSL=$(pick_openssl)
 [ -n "$OSSL" ] || { echo "openssl not found" >&2; exit 1; }
 echo "Using openssl: $OSSL — $("$OSSL" version 2>/dev/null)"; echo
 
+# $PINCMD is intentionally unquoted so it expands to nothing when empty.
 speed_line() {
     if [ -n "$1" ]; then
-        OPENSSL_ia32cap="$1" "$OSSL" speed -elapsed -seconds 1 -evp "$2" 2>/dev/null \
+        OPENSSL_ia32cap="$1" $PINCMD "$OSSL" speed -elapsed -seconds 1 -evp "$2" 2>/dev/null \
             | grep -i "^$2" | tail -n 1
     else
-        ( unset OPENSSL_ia32cap; "$OSSL" speed -elapsed -seconds 1 -evp "$2" 2>/dev/null ) \
+        ( unset OPENSSL_ia32cap; $PINCMD "$OSSL" speed -elapsed -seconds 1 -evp "$2" 2>/dev/null ) \
             | grep -i "^$2" | tail -n 1
     fi
 }
-peak() { echo "$1" | awk '{v=$NF; sub(/[kK]$/,"",v); print v+0}'; }
-NOAES="~0x200000000000000"
+peak() { echo "$1" | awk '{v=$NF; sub(/[kK]$/,"",v); print v+0}'; }   # internal units
+NOAES="~0x200000000000000"          # clears the AES-NI capability bit (word 0, bit 57)
 
-# --- 4. Confirm the userspace toggle works ---------------------------------
+# --- 4. Confirm the userspace toggle actually works ------------------------
 toggle_works=no
 if ! is_libre "$OSSL"; then
     for a in $candidates; do
@@ -132,7 +172,7 @@ echo
 
 # --- 6. WITH/WITHOUT comparison in Mbps, fastest -> slowest ----------------
 echo "=== AES-NI ciphers: WITH vs WITHOUT (fastest -> slowest) ==="
-echo "Throughput in Mbps (megabits/sec). CPU clock sampled per cipher at test time."
+echo "Throughput in Mbps (megabits/sec); for MB/s divide by 8. CPU clock sampled per cipher."
 printf '    %-14s %13s %13s %13s %13s %13s %13s\n' \
        "block size" "16 B" "64 B" "256 B" "1 KiB" "8 KiB" "16 KiB"
 TAB=$(printf '\t')
