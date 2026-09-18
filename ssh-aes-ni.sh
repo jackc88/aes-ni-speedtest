@@ -28,8 +28,13 @@ max_core_mhz() {   # highest current freq across all cores (no-pin / fallback)
             i=0; while [ "$i" -lt "$ncpu" ]; do sysctl -n dev.cpu.$i.freq 2>/dev/null; i=$((i+1)); done \
                 | sort -rn | head -n1 ;;
         Linux)
-            cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null \
-                | sort -rn | head -n1 | awk '{printf "%.0f",$1/1000}' ;;
+            v=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | sort -rn | head -n1)
+            if [ -n "$v" ]; then
+                awk -v v="$v" 'BEGIN{printf "%.0f", v/1000}'          # sysfs: kHz -> MHz
+            else
+                grep -i 'cpu MHz' /proc/cpuinfo 2>/dev/null \
+                    | awk '{print $NF}' | sort -rn | head -n1 | awk '{printf "%.0f",$1}'
+            fi ;;
     esac
 }
 
@@ -40,8 +45,14 @@ cpu_mhz() {        # current clock of the PINNED core (fallback: max core/cluste
             [ -n "$PINCMD" ] && m=$(sysctl -n dev.cpu.$PIN.freq 2>/dev/null)
             [ -z "$m" ] && m=$(max_core_mhz) ;;
         Linux)
+            # 1) sysfs per-core (real cpufreq); 2) /proc/cpuinfo cpu MHz for that core
             if [ -n "$PINCMD" ] && [ -r /sys/devices/system/cpu/cpu$PIN/cpufreq/scaling_cur_freq ]; then
                 m=$(awk '{printf "%.0f",$1/1000}' /sys/devices/system/cpu/cpu$PIN/cpufreq/scaling_cur_freq)
+            elif [ -n "$PINCMD" ]; then
+                m=$(awk -v p="$PIN" '
+                        /^processor[ \t]*:/ { cur=$3 }
+                        /^cpu MHz[ \t]*:/   { if (cur==p) { printf "%.0f",$4; exit } }
+                    ' /proc/cpuinfo 2>/dev/null)
             fi
             [ -z "$m" ] && m=$(max_core_mhz) ;;
         Darwin)
@@ -50,7 +61,7 @@ cpu_mhz() {        # current clock of the PINNED core (fallback: max core/cluste
                 [ "$(id -u)" -eq 0 ] && m=$(powermetrics --samplers cpu_power -i1000 -n1 2>/dev/null \
                     | awk '/[Ff]requency:/ && /MHz/ {for(i=1;i<=NF;i++) if($i=="MHz"){v=$(i-1)+0; if(v>mx)mx=v}} END{if(mx)printf "%.0f",mx}')
             else
-                f=$(sysctl -n hw.cpufrequency 2>/dev/null)   # Intel: Hz
+                f=$(sysctl -n hw.cpufrequency 2>/dev/null)           # Intel: Hz
                 [ -n "$f" ] && m=$(awk -v f="$f" 'BEGIN{printf "%.0f",f/1000000}')
             fi ;;
     esac
